@@ -46,12 +46,9 @@ def safe_read_parquet(path: str) -> pl.DataFrame:
         if "timestamp" in pdf.columns:
             ts = pd.to_datetime(pdf["timestamp"], errors="coerce", utc=True)
             try:
-                ts = ts.dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+                ts = ts.dt.tz_localize(None)
             except Exception:
-                try:
-                    ts = ts.dt.tz_localize(None)
-                except Exception:
-                    pass
+                pass
             pdf["timestamp"] = ts
 
         return pl.from_pandas(pdf)
