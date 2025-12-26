@@ -1012,6 +1012,22 @@ def nightly_watchlist(panel: pd.DataFrame, feats: List[str],
 def compute_shap_latest(panel: pd.DataFrame, feats: List[str], model, top_k: int = TOP_SHAP_PER_SYMBOL, shap_max_symbols: Optional[int] = None):
     try: import shap
     except Exception: raise SystemExit("shap not installed. Run: pip install shap")
+
+    def _unwrap_model_for_shap(m):
+        try:
+            from sklearn.calibration import CalibratedClassifierCV
+        except Exception:
+            CalibratedClassifierCV = tuple()  # type: ignore
+        if isinstance(m, CalibratedClassifierCV):
+            try:
+                calibrators = getattr(m, "calibrated_classifiers_", None)
+                base = calibrators[0].base_estimator if calibrators else None
+                if base is not None:
+                    print("Using CalibratedClassifierCV base_estimator for SHAP.")
+                    return base
+            except Exception as e:
+                print(f"WARNING: Failed to unwrap CalibratedClassifierCV for SHAP ({e}); falling back to original model.")
+        return m
     latest = panel.groupby("symbol", as_index=False).tail(1).copy()
     latest["avg20_vol"] = panel.groupby("symbol")["volume"].tail(1).values if "avg20_vol" not in latest \
         else latest["avg20_vol"]
@@ -1021,7 +1037,12 @@ def compute_shap_latest(panel: pd.DataFrame, feats: List[str], model, top_k: int
     X = sanitize_feature_matrix(latest[feats].copy())
     print("Computing SHAP values on latest rows...")
     import shap as _shap_mod
-    explainer = _shap_mod.TreeExplainer(model)
+    shap_model = _unwrap_model_for_shap(model)
+    try:
+        explainer = _shap_mod.TreeExplainer(shap_model)
+    except Exception as e:
+        print(f"SHAP computation skipped: TreeExplainer does not support model type ({e}).")
+        return pd.DataFrame(), pd.DataFrame()
     shap_vals = explainer.shap_values(X)
     if isinstance(shap_vals, list) and len(shap_vals) >= 2:
         shap_arr = shap_vals[1]  # positive class for classifier

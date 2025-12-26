@@ -21,3 +21,4 @@
 ## Implemented improvements
 * CSV ingestion now parses timestamps during read and enforces deterministic file ordering before dispatching work to the thread pool, improving prep speed and reproducibility when resuming large universes.
 * Checkpointing utilities lazily require `joblib`, so lightweight commands such as `--help` or panel-only runs no longer fail if the dependency is missing; installation guidance is emitted only when model I/O is invoked.
+* SHAP computation now unwraps calibrated classifiers to their base estimators and skips unsupported model types gracefully, avoiding crashes when using calibrated 1D models.
