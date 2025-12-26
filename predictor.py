@@ -5,7 +5,7 @@
 # faster chunking, checkpoints, SHAP, WhatWorked, combined summary.
 # Author: M365 Copilot for Singh, Karanveer
 
-import os, glob, json, time, sys, re, datetime as dt, itertools, math
+import os, glob, json, time, sys, re, datetime as dt, itertools, math, concurrent.futures, importlib
 from pathlib import Path
 from collections import defaultdict, OrderedDict
 from typing import List, Optional, Dict, Tuple
@@ -206,6 +206,8 @@ def parse_cli():
     # Perf/quality knobs
     ap.add_argument("--chunk-size", type=int, default=CHUNK_SIZE,
                     help="Symbols per write chunk for panel (default=150).")
+    ap.add_argument("--load-workers", type=int, default=max(1, min(8, os.cpu_count() or 1)),
+                    help="Parallel workers for loading/featureizing daily files (default=min(8, cores)).")
     ap.add_argument("--n-estimators-1d", type=int, default=N_EST_1D,
                     help="LightGBM trees for 1D model (default=300).")
     ap.add_argument("--n-estimators-3d", type=int, default=N_EST_3D,
@@ -228,7 +230,7 @@ def parse_cli():
                     choices=["cls", "reg", "both"],
                     help="Train 1D as classification (calibrated prob), regression, or both (default=cls).")
     ap.add_argument("--cls-margin", type=float, default=CLS_MARGIN,
-                    help="Neutral margin (%) around 0 for 1D classification; rows with |ret|≤margin are excluded.")
+                    help="Neutral margin (%%) around 0 for 1D classification; rows with |ret|≤margin are excluded.")
     return ap.parse_args()
 
 def setup_paths(out_dir: str):
@@ -313,7 +315,10 @@ def load_one(path: Path) -> pd.DataFrame:
         if path.suffix.lower() == ".parquet":
             df = pd.read_parquet(path)
         else:
-            df = pd.read_csv(path)
+            try:
+                df = pd.read_csv(path, parse_dates=["timestamp"], infer_datetime_format=True)
+            except ValueError:
+                df = pd.read_csv(path)
     except Exception as e:
         raise RuntimeError(f"Load failed: {e}")
     if "timestamp" not in df.columns:
@@ -321,7 +326,8 @@ def load_one(path: Path) -> pd.DataFrame:
             df = df.rename(columns={"date": "timestamp"})
         else:
             raise RuntimeError("'timestamp' column missing")
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    if not np.issubdtype(df["timestamp"].dtype, np.datetime64):
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df = df.dropna(subset=["timestamp"])
     df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
     df = _ensure_unique_columns(df)
@@ -514,7 +520,36 @@ def _derive_symbol_name(p: Path) -> str:
     name = re.sub(r"\.(parquet|csv)$","",name, flags=re.IGNORECASE)
     return name
 
-def collect_panel_from_paths(paths: List[Path]):
+def _prepare_panel_rows(path_obj: Path):
+    sym = _derive_symbol_name(path_obj)
+    try:
+        df = load_one(path_obj)
+        # upstream sanity checks (ranges)
+        def _range_check(col, lo, hi):
+            if col in df.columns:
+                s = pd.to_numeric(df[col], errors="coerce")
+                bad = (~s.between(lo,hi)) & s.notna()
+                if bad.any():
+                    _log_load_error(sym, str(path_obj), f"Range anomaly {col} out of [{lo},{hi}] on {bad.sum()} rows")
+        _range_check("D_rsi14", 0, 100)
+        df = add_targets(df)
+        df, feats = featureize(df)
+        df = score_bias(df)
+        df["symbol"] = sym
+        df_train = df.dropna(subset=["ret_1d_close_pct"])
+        if df_train.empty:
+            nrows = len(df)
+            msg = (f"NO TRAIN {sym} rows={nrows} "
+                   f"req_cols_ok={all(c in df.columns for c in ['timestamp','open','high','low','close','volume'])}")
+            return sym, None, feats, msg
+        rows = df_train[["timestamp","symbol","open","high","low","close","volume"] + feats +
+                        ["ret_1d_close_pct","ret_3d_close_pct","ret_5d_close_pct",
+                         "long_score","short_score","D_atr14","D_cpr_width_pct"]].copy()
+        return sym, rows, feats, None
+    except Exception as e:
+        return sym, None, None, e
+
+def collect_panel_from_paths(paths: List[Path], load_workers: int = 1):
     # Expand any directories to files here to keep function simple
     expanded: List[Path] = []
     for p in paths:
@@ -522,7 +557,7 @@ def collect_panel_from_paths(paths: List[Path]):
             expanded += _strict_file_list(str(p), None, None, accept_any_daily=False)
         else:
             expanded.append(Path(p))
-    paths = expanded
+    paths = sorted(expanded)
 
     total = len(paths)
     if total == 0:
@@ -536,55 +571,73 @@ def collect_panel_from_paths(paths: List[Path]):
     eta = ProgressETA(total=total, label="Load+Engineer")
     chunk: List[pd.DataFrame] = []
     total_rows_written = 0
-    for p in paths:
-        path_obj = Path(p)
-        sym = _derive_symbol_name(path_obj)
-        if sym in processed:
-            eta.tick(f"SKIP {sym}")
-            continue
-        try:
-            df = load_one(path_obj)
-            # upstream sanity checks (ranges)
-            def _range_check(col, lo, hi):
-                if col in df.columns:
-                    s = pd.to_numeric(df[col], errors="coerce")
-                    bad = (~s.between(lo,hi)) & s.notna()
-                    if bad.any():
-                        _log_load_error(sym, str(path_obj), f"Range anomaly {col} out of [{lo},{hi}] on {bad.sum()} rows")
-            _range_check("D_rsi14", 0, 100)
-            df = add_targets(df)
-            df, feats = featureize(df)
-            df = score_bias(df)
-            df["symbol"] = sym
-            df_train = df.dropna(subset=["ret_1d_close_pct"])
-            if df_train.empty:
-                nrows = len(df)
-                msg = (f"NO TRAIN {sym} rows={nrows} "
-                       f"req_cols_ok={all(c in df.columns for c in ['timestamp','open','high','low','close','volume'])}")
-                print("[Load+Engineer]", msg)
-                eta.tick(msg)
-                mark_processed(sym)
+    feats: Optional[List[str]] = None
+
+    def _pending_paths():
+        for path_obj in paths:
+            sym = _derive_symbol_name(path_obj)
+            if sym in processed:
+                eta.tick(f"SKIP {sym}")
                 continue
-            rows = df_train[["timestamp","symbol","open","high","low","close","volume"] + feats +
-                            ["ret_1d_close_pct","ret_3d_close_pct","ret_5d_close_pct",
-                             "long_score","short_score","D_atr14","D_cpr_width_pct"]].copy()
-            chunk.append(rows)
-            total_rows_written += len(rows)
-            if len(chunk) >= CHUNK_SIZE:
-                header_written = append_panel_rows(chunk, header_written)
-                chunk.clear()
-            mark_processed(sym)
-            eta.tick(f"OK {sym} (+{len(rows)} rows)")
-        except KeyboardInterrupt:
-            print("\nInterrupted! Autosaving current chunk...")
-            if chunk:
-                header_written = append_panel_rows(chunk, header_written)
-                chunk.clear()
-            raise
-        except Exception as e:
-            _log_load_error(sym, str(path_obj), str(e))
-            eta.tick(f"ERR {sym}: {e}")
-            # do NOT mark processed on failure; allow retry next run
+            yield path_obj
+
+    def _prepare_with_path(path_obj: Path):
+        return path_obj, _prepare_panel_rows(path_obj)
+
+    try:
+        if load_workers > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=int(load_workers)) as ex:
+                for path_obj, result in ex.map(_prepare_with_path, _pending_paths()):
+                    sym, rows, feats_out, msg_or_err = result
+                    if isinstance(msg_or_err, Exception):
+                        _log_load_error(sym, str(path_obj), str(msg_or_err))
+                        eta.tick(f"ERR {sym}: {msg_or_err}")
+                        continue
+                    if msg_or_err:
+                        print("[Load+Engineer]", msg_or_err)
+                        eta.tick(msg_or_err)
+                        mark_processed(sym)
+                        continue
+                    chunk.append(rows)
+                    if feats_out is not None:
+                        feats = feats_out
+                    total_rows_written += len(rows)
+                    if len(chunk) >= CHUNK_SIZE:
+                        header_written = append_panel_rows(chunk, header_written)
+                        chunk.clear()
+                    mark_processed(sym)
+                    eta.tick(f"OK {sym} (+{len(rows)} rows)")
+        else:
+            for path_obj in paths:
+                sym = _derive_symbol_name(path_obj)
+                if sym in processed:
+                    eta.tick(f"SKIP {sym}")
+                    continue
+                sym, rows, feats_out, msg_or_err = _prepare_panel_rows(path_obj)
+                if isinstance(msg_or_err, Exception):
+                    _log_load_error(sym, str(path_obj), str(msg_or_err))
+                    eta.tick(f"ERR {sym}: {msg_or_err}")
+                    continue
+                if msg_or_err:
+                    print("[Load+Engineer]", msg_or_err)
+                    eta.tick(msg_or_err)
+                    mark_processed(sym)
+                    continue
+                chunk.append(rows)
+                if feats_out is not None:
+                    feats = feats_out
+                total_rows_written += len(rows)
+                if len(chunk) >= CHUNK_SIZE:
+                    header_written = append_panel_rows(chunk, header_written)
+                    chunk.clear()
+                mark_processed(sym)
+                eta.tick(f"OK {sym} (+{len(rows)} rows)")
+    except KeyboardInterrupt:
+        print("\nInterrupted! Autosaving current chunk...")
+        if chunk:
+            header_written = append_panel_rows(chunk, header_written)
+            chunk.clear()
+        raise
     if chunk:
         header_written = append_panel_rows(chunk, header_written)
         chunk.clear()
@@ -600,7 +653,7 @@ def collect_panel_from_paths(paths: List[Path]):
             " • Inspect a file to confirm columns: [timestamp, open, high, low, close, volume]\n"
             " • Ensure enough rows so ret_1d_close_pct isn’t all NaN"
         )
-    panel = pd.read_csv(PANEL_OUT, low_memory=False)
+    panel = pd.read_csv(PANEL_OUT, low_memory=False, parse_dates=["timestamp"], infer_datetime_format=True)
     panel["timestamp"] = pd.to_datetime(panel["timestamp"], errors="coerce")
     panel = panel.dropna(subset=["timestamp"]).sort_values(["symbol","timestamp"]).reset_index(drop=True)
     feats = [
@@ -1063,8 +1116,14 @@ def write_excel_topN(panel: pd.DataFrame, out_dir: str, n: int):
         print(f"Excel write failed ({e}); install openpyxl to enable --excel-top-rows")
 
 # ===================== Checkpoints =====================
-import joblib
+def _load_joblib():
+    spec = importlib.util.find_spec("joblib")
+    if spec is None:
+        raise SystemExit("joblib is required for saving/loading checkpoints. Please run `pip install joblib`.")
+    return importlib.import_module("joblib")
+
 def maybe_load_model(path: Path):
+    joblib = _load_joblib()
     try:
         if path.exists():
             print(f"Loading checkpoint: {path}")
@@ -1074,6 +1133,7 @@ def maybe_load_model(path: Path):
     return None
 
 def save_model(path: Path, model):
+    joblib = _load_joblib()
     try:
         joblib.dump(model, path)
         print(f"Saved model checkpoint: {path}")
@@ -1628,7 +1688,7 @@ def main():
                     or c.startswith("Struct_") or c.startswith("DayType_"))]
     else:
         paths = resolve_input_paths(args)
-        panel, feats = collect_panel_from_paths(paths)
+        panel, feats = collect_panel_from_paths(paths, load_workers=int(args.load_workers))
 
     write_status("panel_build", "done")
     print(f"Panel rows: {len(panel)} symbols: {panel['symbol'].nunique()} feats: {len(feats)}")
