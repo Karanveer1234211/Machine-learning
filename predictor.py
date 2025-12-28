@@ -1,31 +1,46 @@
 
-# predictor_v5_5_resume_fixed.py
-# v5.5-resume-fixed — GUI file/folder picker, resume panel (no rebuild unless --rebuild),
-# 1D classification + isotonic calibration (version-aware), residual-based 5D std,
-# faster chunking, checkpoints, SHAP, WhatWorked, combined summary.
+# predictor_v5_7_parquet_shap_safe.py
+# v5.7 — Panel & Year-by-year splits in Parquet; final outputs remain CSV.
+# Adds tz-safe timestamp handling AND robust SHAP handling:
+# - Unwrap CalibratedClassifierCV to LightGBM if possible
+# - Skip SHAP gracefully if unsupported (no crash or KeyError)
 # Author: M365 Copilot for Singh, Karanveer
 
-import os, glob, json, time, sys, re, datetime as dt, itertools, math
+import os, glob, json, time, sys, re, datetime as dt, itertools, math, concurrent.futures, importlib
 from pathlib import Path
 from collections import defaultdict, OrderedDict
 from typing import List, Optional, Dict, Tuple
+
 import numpy as np
 import pandas as pd
+
+# Try pyarrow for streaming parquet
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    _PA_OK = True
+except Exception:
+    _PA_OK = False
 
 # ===================== DEFAULTS / PATHS =====================
 DATA_DIR_DEFAULT = r"C:\\Users\\karanvsi\\Desktop\\Pycharm\\Cache\\cache_daily_new"
 
-PANEL_OUT = None
-PROCESSED_LIST = None
+# Panel now in Parquet
+PANEL_OUT = None            # panel_cache.parquet
+PROCESSED_LIST = None       # processed_symbols.txt
 WATCHLIST_OUT = None
+
 SHAP_CARDS_CSV = None
 SHAP_CARDS_JSON = None
 SHAP_GLOBAL_SUMMARY = None
+
 GLOBAL_WORKS_1D_XLSX = None
 GLOBAL_WORKS_3D_XLSX = None
 GLOBAL_WORKS_5D_XLSX = None
 SYMBOL_PLAYBOOKS_XLSX = None
+
 ACTIONABLE_5D_OUT = None
+
 LOG_DIR = None
 LOAD_ERRORS_LOG = None
 QUARANTINE_LIST = None
@@ -44,15 +59,16 @@ N_EST_5D = N_EST_ALL
 # Early stopping
 EARLY_STOPPING_ROUNDS = 50
 
-# LGB Params (shared defaults; can extend)
+# LGB shared params
 MAX_DEPTH_ALL = 8
 
 # Filters for watchlist
 MIN_CLOSE = 50.0
 MIN_AVG20_VOL = 200_000
+
 TOP_SHAP_PER_SYMBOL = 10
 COMPUTE_SHAP_FOR = ["1d"]  # add "3d","5d" if needed
-SHAP_MAX_SYMBOLS = None  # CLI
+SHAP_MAX_SYMBOLS = None     # CLI
 
 # Chunking / Excel safety
 CHUNK_SIZE = 150
@@ -62,10 +78,11 @@ EXCEL_MAX = 1_000_000
 MIN_SUPPORT_GLOBAL = 2000
 MIN_SUPPORT_COMBO = 2500
 
-# Size-aware support thresholds for higher-order combos
-MAX_COMBO_SIZE = 3  # default tighter cap (can increase via CLI)
+# Size-aware support for higher-order combos
+MAX_COMBO_SIZE = 3
 MIN_SUPPORT_COMBO_4 = 4000
 MIN_SUPPORT_COMBO_5 = 8000
+
 TOP_ROWS_PER_SYMBOL = 5
 
 # Approvals/gates for Actionable
@@ -76,13 +93,8 @@ FDR_ALPHA = 0.05
 WRITE_ACTIONABLE_5D = True
 
 # HAC / inference controls
-HAC_LAG = "auto"  # "auto"|int
+HAC_LAG = "auto"   # "auto" \ integer
 THIN_INFERENCE = True  # thin overlapping rows for 3D/5D inference
-
-# Notes/conviction thresholds for combined summary
-STRONG_HITRATE_1D = 55.0  # %
-STRONG_HITRATE_5D = 55.0  # %
-MIN_PLAYBOOK_SUPPORT = 50  # rows per symbol-condition
 
 # Probability std options for 5D
 PROB_STD_METHOD = "residual"  # "residual"|"symbol_hist"|"cross"|"none"
@@ -100,6 +112,7 @@ class ProgressETA:
         self.start = time.perf_counter()
         self.done = 0
         self._last = ""
+
     def tick(self, note:str=""):
         self.done += 1
         elapsed = max(1e-6, time.perf_counter() - self.start)
@@ -163,7 +176,7 @@ def parse_cli():
     ap.add_argument("--gui", action="store_true",
                     help="Open GUI picker to choose files or a folder.")
     ap.add_argument("--panel-path", type=str, default=None,
-                    help="Optional: path to an existing panel_cache.csv to load (skip collection).")
+                    help="Optional: path to an existing panel (parquet/csv) to load (skip collection).")
     ap.add_argument("--out-dir", default=".",
                     help="Folder to save outputs (panel, models, watchlist, SHAP, logs).")
     ap.add_argument("--symbols-like", default=None,
@@ -171,7 +184,8 @@ def parse_cli():
     ap.add_argument("--limit-files", type=int, default=None,
                     help="Cap number of files to process (quick tests).")
     ap.add_argument("--rebuild", action="store_true",
-                    help="Delete panel_cache.csv & processed_symbols.txt before run.")
+                    help="Delete panel_cache and processed_symbols before run.")
+
     # CV & inference rigor
     ap.add_argument("--cv-splits", type=int, default=FOLDS,
                     help="Number of walk-forward folds (default=5).")
@@ -181,11 +195,13 @@ def parse_cli():
                     help='Lag for HAC (Newey–West) SE of mean: "auto" or integer.')
     ap.add_argument("--thin-inference", type=str, default=str(THIN_INFERENCE),
                     help='Use non-overlapping rows for 3D/5D WhatWorked ("true"/"false").')
+
     # Accuracy windows & symbol reports
     ap.add_argument("--last-month-days", type=int, default=30,
                     help="Calendar days for recent-accuracy report (default=30).")
     ap.add_argument("--write-symbol-accuracy", type=str, default="true",
                     help='Write symbol-wise accuracy report across full OOS ("true"/"false").')
+
     # WhatWorked knobs
     ap.add_argument("--max-combo-size", type=int, default=MAX_COMBO_SIZE,
                     help="Maximum combo size for WhatWorked (default=3).")
@@ -195,17 +211,22 @@ def parse_cli():
                     help="Minimal support for size 2–3 combos (default=2500).")
     ap.add_argument("--min-support-combo-4", type=int, default=MIN_SUPPORT_COMBO_4)
     ap.add_argument("--min-support-combo-5", type=int, default=MIN_SUPPORT_COMBO_5)
-    # Optional Excel-friendly exports
+
+    # Optional Excel-friendly exports (UNCHANGED: Only written if you pass these flags)
     ap.add_argument("--excel-compact", action="store_true",
                     help="Write panel_compact.xlsx (Latest + SymbolsSummary).")
     ap.add_argument("--excel-top-rows", type=int, default=None,
                     help=f"Write panel_topN.xlsx with first N rows (≤{EXCEL_MAX}).")
+
     # Accept broader daily naming
     ap.add_argument("--accept-any-daily", type=str, default="false",
                     help='Accept *.parquet/*.csv besides *_daily.* ("true"/"false").')
+
     # Perf/quality knobs
     ap.add_argument("--chunk-size", type=int, default=CHUNK_SIZE,
                     help="Symbols per write chunk for panel (default=150).")
+    ap.add_argument("--load-workers", type=int, default=max(1, min(8, os.cpu_count() or 1)),
+                    help="Parallel workers for loading/featureizing daily files (default=min(8, cores)).")
     ap.add_argument("--n-estimators-1d", type=int, default=N_EST_1D,
                     help="LightGBM trees for 1D model (default=300).")
     ap.add_argument("--n-estimators-3d", type=int, default=N_EST_3D,
@@ -218,11 +239,12 @@ def parse_cli():
                     help="Cap count of symbols for SHAP after liquidity filter (optional).")
     ap.add_argument("--prob-std-method", type=str, default=PROB_STD_METHOD,
                     choices=["residual", "symbol_hist", "cross", "none"],
-                    help="Std method for prob_up_5d: residual (OOS error), symbol_hist (realized 5D rolling), cross (pred 5D x-sec), none (heuristic).")
+                    help="Std method for prob_up_5d.")
     ap.add_argument("--prob-std-window", type=int, default=PROB_STD_WINDOW,
                     help="Rolling window (days) for symbol_hist (default=252).")
     ap.add_argument("--prob-std-min-rows", type=int, default=PROB_STD_MIN_ROWS,
                     help="Minimum rows required for symbol_hist std (default=60).")
+
     # 1D classification mode
     ap.add_argument("--train-1d-mode", type=str, default="cls",
                     choices=["cls", "reg", "both"],
@@ -234,22 +256,28 @@ def parse_cli():
 def setup_paths(out_dir: str):
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+
     global PANEL_OUT, PROCESSED_LIST, WATCHLIST_OUT
     global SHAP_CARDS_CSV, SHAP_CARDS_JSON, SHAP_GLOBAL_SUMMARY
     global GLOBAL_WORKS_1D_XLSX, GLOBAL_WORKS_3D_XLSX, GLOBAL_WORKS_5D_XLSX
     global SYMBOL_PLAYBOOKS_XLSX, ACTIONABLE_5D_OUT
     global LOG_DIR, LOAD_ERRORS_LOG, QUARANTINE_LIST, STATUS_PATH
-    PANEL_OUT = str(out / "panel_cache.csv")
+
+    PANEL_OUT = str(out / "panel_cache.parquet")  # parquet panel
     PROCESSED_LIST = str(out / "processed_symbols.txt")
     WATCHLIST_OUT = str(out / "watchlist_model_next_1_3_5d.csv")
+
     SHAP_CARDS_CSV = str(out / "shap_cards_latest.csv")
     SHAP_CARDS_JSON = str(out / "shap_lookout_cards_latest.json")
     SHAP_GLOBAL_SUMMARY = str(out / "shap_global_summary.csv")
+
     GLOBAL_WORKS_1D_XLSX = str(out / "global_what_works_1d.xlsx")
     GLOBAL_WORKS_3D_XLSX = str(out / "global_what_works_3d.xlsx")
     GLOBAL_WORKS_5D_XLSX = str(out / "global_what_works_5d.xlsx")
     SYMBOL_PLAYBOOKS_XLSX = str(out / "symbol_playbooks.xlsx")
+
     ACTIONABLE_5D_OUT = str(out / "actionable_watchlist_5d.csv")
+
     LOG_DIR = out / "logs"
     LOG_DIR.mkdir(exist_ok=True)
     LOAD_ERRORS_LOG = LOG_DIR / "load_errors.csv"
@@ -308,22 +336,54 @@ def _ensure_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = new_cols
     return df
 
+# ---------- TZ-safe helpers ----------
+from pandas.api.types import is_datetime64_any_dtype, is_datetime64tz_dtype
+
+def ensure_kolkata_tz(series: pd.Series) -> pd.Series:
+    """
+    Normalize timestamps to Asia/Kolkata reliably:
+    - Parse as UTC first (even if naive), then convert to Asia/Kolkata.
+    """
+    ts = pd.to_datetime(series, errors="coerce", utc=True)
+    try:
+        return ts.dt.tz_convert("Asia/Kolkata")
+    except Exception:
+        return pd.to_datetime(series, errors="coerce").dt.tz_localize("Asia/Kolkata")
+
+def _ensure_ts_ist(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["timestamp"] = ensure_kolkata_tz(df["timestamp"])
+    return df
+
 def load_one(path: Path) -> pd.DataFrame:
+    """
+    Load one symbol's daily file (parquet/csv), ensure:
+    - timestamp column present & tz-safe (Asia/Kolkata)
+    - sorted, deduped
+    """
     try:
         if path.suffix.lower() == ".parquet":
             df = pd.read_parquet(path)
         else:
-            df = pd.read_csv(path)
+            try:
+                df = pd.read_csv(path, parse_dates=["timestamp"], infer_datetime_format=True)
+            except ValueError:
+                df = pd.read_csv(path)
     except Exception as e:
         raise RuntimeError(f"Load failed: {e}")
+
     if "timestamp" not in df.columns:
         if "date" in df.columns:
             df = df.rename(columns={"date": "timestamp"})
         else:
             raise RuntimeError("'timestamp' column missing")
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    df = df.dropna(subset=["timestamp"])
-    df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
+
+    if not (is_datetime64_any_dtype(df["timestamp"]) or is_datetime64tz_dtype(df["timestamp"])):
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+
+    df = _ensure_ts_ist(df)
+    df = df.dropna(subset=["timestamp"]).sort_values("timestamp") \
+           .drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
     df = _ensure_unique_columns(df)
     return df
 
@@ -360,11 +420,12 @@ LAG_FEATURES = [
     "D_obv_slope_lag1","D_obv_slope_lag2",
 ]
 CPR_YDAY = [f"CPR_Yday_{x}" for x in ("Above","Below","Inside","Overlap")]
-CPR_TMR = [f"CPR_Tmr_{x}" for x in ("Above","Below","Inside","Overlap")]
+CPR_TMR  = [f"CPR_Tmr_{x}"  for x in ("Above","Below","Inside","Overlap")]
 STRUCT_ONEHOT = ["Struct_uptrend","Struct_downtrend","Struct_range"]
 DAYTYPE_ONEHOT = ["DayType_bullish","DayType_bearish","DayType_inside"]
 
 def add_targets(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
     for h in (1,3,5):
         df[f"ret_{h}d_close_pct"] = (df["close"].shift(-h) / df["close"] - 1) * 100
     # open-to-close variants
@@ -375,11 +436,11 @@ def add_targets(df: pd.DataFrame) -> pd.DataFrame:
         lo = df["low"].shift(-1).rolling(h, min_periods=1).min()
         df[f"mfe_{h}d_pct"] = (hi / df["close"] - 1) * 100
         df[f"mae_{h}d_pct"] = (lo / df["close"] - 1) * 100
-    # classification target helper: raw sign (we'll apply margin later)
     df["ret_1d_sign"] = np.sign(df["ret_1d_close_pct"])
     return df
 
 def add_lags(df: pd.DataFrame, cols: List[str], lags: Tuple[int,int]=(1,2)):
+    df = df.copy()
     for c in cols:
         if c in df.columns:
             for L in lags:
@@ -388,74 +449,91 @@ def add_lags(df: pd.DataFrame, cols: List[str], lags: Tuple[int,int]=(1,2)):
 
 def featureize(df: pd.DataFrame):
     df = add_lags(df, ["D_rsi14","D_adx14","D_ema20_angle_deg","D_obv_slope"], lags=(1,2))
+
     # Unify CPR categorical variants to one-hot
     yday_unified = _unify_categorical(df, "D_cpr_vs_yday")
-    tmr_unified = _unify_categorical(df, "D_tmr_cpr_vs_today")
+    tmr_unified  = _unify_categorical(df, "D_tmr_cpr_vs_today")
+
     if yday_unified.notna().any():
-        df = df.drop(columns=[c for c in df.columns if c == "D_cpr_vs_yday" or c.startswith("D_cpr_vs_yday__dup")], errors="ignore")
+        df = df.drop(columns=[c for c in df.columns
+                              if c == "D_cpr_vs_yday" or c.startswith("D_cpr_vs_yday__dup")], errors="ignore")
         df["D_cpr_vs_yday_unified"] = yday_unified
         df = pd.get_dummies(df, columns=["D_cpr_vs_yday_unified"], prefix="CPR_Yday")
     if tmr_unified.notna().any():
-        df = df.drop(columns=[c for c in df.columns if c == "D_tmr_cpr_vs_today" or c.startswith("D_tmr_cpr_vs_today__dup")], errors="ignore")
+        df = df.drop(columns=[c for c in df.columns
+                              if c == "D_tmr_cpr_vs_today" or c.startswith("D_tmr_cpr_vs_today__dup")], errors="ignore")
         df["D_tmr_cpr_vs_today_unified"] = tmr_unified
         df = pd.get_dummies(df, columns=["D_tmr_cpr_vs_today_unified"], prefix="CPR_Tmr")
+
     for col in CPR_YDAY:
-        if col not in df.columns: df[col] = 0
+      if col not in df.columns: df[col] = 0
     for col in CPR_TMR:
-        if col not in df.columns: df[col] = 0
+      if col not in df.columns: df[col] = 0
+
     # Optional structure/day onehots
     if "D_structure_trend" in df.columns:
         df["D_structure_trend"] = df["D_structure_trend"].astype("string")
         df = pd.get_dummies(df, columns=["D_structure_trend"], prefix="Struct")
     for col in STRUCT_ONEHOT:
         if col not in df.columns: df[col] = 0
+
     if "D_day_type" in df.columns:
         df["D_day_type"] = df["D_day_type"].astype("string")
         df = pd.get_dummies(df, columns=["D_day_type"], prefix="DayType")
     for col in DAYTYPE_ONEHOT:
         if col not in df.columns: df[col] = 0
+
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     df = df.loc[:, ~df.columns.duplicated()]
+
     feats = DAILY_BASE_FEATURES + LAG_FEATURES + CPR_YDAY + CPR_TMR + STRUCT_ONEHOT + DAYTYPE_ONEHOT
     return df, feats
 
 def score_bias(df: pd.DataFrame) -> pd.DataFrame:
     col = lambda c: df[c] if c in df.columns else pd.Series([np.nan]*len(df))
-    golden = col("D_golden_regime").fillna(False).astype(bool)
+    golden    = col("D_golden_regime").fillna(False).astype(bool)
     ema_stack = col("D_ema_stack_20_50_100").fillna(False).astype(bool)
-    rsi14 = pd.to_numeric(col("D_rsi14"), errors="coerce")
+    rsi14     = pd.to_numeric(col("D_rsi14"), errors="coerce")
     rsi_cross = col("D_rsi7_gt_rsi14").fillna(False).astype(bool)
-    adx14 = pd.to_numeric(col("D_adx14"), errors="coerce")
-    pdi14 = pd.to_numeric(col("D_pdi14"), errors="coerce")
-    mdi14 = pd.to_numeric(col("D_mdi14"), errors="coerce")
-    obv_rise = col("D_price_and_obv_rising").fillna(False).astype(bool)
-    atr14 = pd.to_numeric(col("D_atr14"), errors="coerce")
-    cpr_w = pd.to_numeric(col("D_cpr_width_pct"), errors="coerce")
-    vol = pd.to_numeric(df["volume"], errors="coerce")
-    avg20 = vol.rolling(20, min_periods=1).mean()
+    adx14     = pd.to_numeric(col("D_adx14"), errors="coerce")
+    pdi14     = pd.to_numeric(col("D_pdi14"), errors="coerce")
+    mdi14     = pd.to_numeric(col("D_mdi14"), errors="coerce")
+    obv_rise  = col("D_price_and_obv_rising").fillna(False).astype(bool)
+    atr14     = pd.to_numeric(col("D_atr14"), errors="coerce")
+    cpr_w     = pd.to_numeric(col("D_cpr_width_pct"), errors="coerce")
+    vol       = pd.to_numeric(df["volume"], errors="coerce")
+    avg20     = vol.rolling(20, min_periods=1).mean()
     cpr_above = (df.get("CPR_Yday_Above", 0) == 1)
     cpr_below = (df.get("CPR_Yday_Below", 0) == 1)
+
     long_score = (
-        (golden*2).astype(float) + (ema_stack*2).astype(float) + (rsi_cross*1).astype(float) +
-        ((rsi14.between(50,70, inclusive="both").fillna(False).astype(float)*1)) +
-        ((((adx14>20)&(pdi14>mdi14)).fillna(False).astype(float)*1.5)) +
-        (obv_rise*1).astype(float) + (cpr_above.astype(float)*0.5) +
-        (((pd.to_numeric(col("D_daily_trend"), errors="coerce")==1) &
-          (pd.to_numeric(col("D_weekly_trend"), errors="coerce")==1)).fillna(False).astype(float)*0.5)
+        (golden*2).astype(float)
+      + (ema_stack*2).astype(float)
+      + (rsi_cross*1).astype(float)
+      + ((rsi14.between(50,70, inclusive="both").fillna(False).astype(float)*1))
+      + ((((adx14>20)&(pdi14>mdi14)).fillna(False).astype(float)*1.5))
+      + (obv_rise*1).astype(float)
+      + (cpr_above.astype(float)*0.5)
+      + (((pd.to_numeric(col("D_daily_trend"), errors="coerce")==1)
+          & (pd.to_numeric(col("D_weekly_trend"), errors="coerce")==1)).fillna(False).astype(float)*0.5)
     )
+
     short_score = (
-        ((~golden)*1).astype(float) + ((~ema_stack)*1).astype(float) +
-        ((rsi14<45).fillna(False).astype(float)*1) +
-        (((adx14>20)&(mdi14>pdi14)).fillna(False).astype(float)*1.5) +
-        (cpr_below.astype(float)*0.5) +
-        (((pd.to_numeric(col("D_daily_trend"), errors="coerce")==-1) &
-          (pd.to_numeric(col("D_weekly_trend"), errors="coerce")==-1)).fillna(False).astype(float)*0.5)
+        ((~golden)*1).astype(float)
+      + ((~ema_stack)*1).astype(float)
+      + ((rsi14<45).fillna(False).astype(float)*1)
+      + (((adx14>20)&(mdi14>pdi14)).fillna(False).astype(float)*1.5)
+      + (cpr_below.astype(float)*0.5)
+      + (((pd.to_numeric(col("D_daily_trend"), errors="coerce")==-1)
+          & (pd.to_numeric(col("D_weekly_trend"), errors="coerce")==-1)).fillna(False).astype(float)*0.5)
     )
+
     atr_pct = (atr14/df["close"]).replace([np.inf,-np.inf],np.nan)*100
     risk_pen = (atr_pct>4).fillna(False).astype(float)*0.5 + (cpr_w>1.0).fillna(False).astype(float)*0.3
-    liq_pen = (avg20<MIN_AVG20_VOL).fillna(False).astype(float)*0.5
-    df["long_score"] = long_score - risk_pen - liq_pen
+    liq_pen  = (avg20<MIN_AVG20_VOL).fillna(False).astype(float)*0.5
+
+    df["long_score"]  = long_score  - risk_pen - liq_pen
     df["short_score"] = short_score - risk_pen - liq_pen
     return df
 
@@ -489,24 +567,50 @@ MASTER_KEEP_STATIC = _unique_preserve(
     + DAILY_BASE_FEATURES + LAG_FEATURES + CPR_YDAY + CPR_TMR + STRUCT_ONEHOT + DAYTYPE_ONEHOT
 )
 
-def append_panel_rows(chunks: List[pd.DataFrame], header_written: bool):
-    if not chunks: return header_written
-    aligned: List[pd.DataFrame] = []
-    for df in chunks:
-        df = _ensure_unique_columns(df)
+# ----------- Parquet streaming writer -----------
+class PanelParquetWriter:
+    """
+    Streaming writer that writes chunked pandas DataFrames to a single parquet file.
+    Requires pyarrow. If pyarrow is unavailable, raises a clear error.
+    """
+    def __init__(self, out_path: str):
+        if not _PA_OK:
+            raise SystemExit("pyarrow is required to write panel_cache.parquet. Please run: pip install pyarrow")
+        self.out_path = out_path
+        self._writer = None
+        self._schema = None
+
+    def write_chunk(self, df: pd.DataFrame):
+        if df is None or df.empty: return
+        # Ensure consistent column order
         for col in MASTER_KEEP_STATIC:
             if col not in df.columns:
-                if (col.startswith("CPR_Yday_") or col.startswith("CPR_Tmr_") or
-                    col.startswith("Struct_") or col.startswith("DayType_")):
+                if (col.startswith("CPR_Yday_") or col.startswith("CPR_Tmr_")
+                    or col.startswith("Struct_") or col.startswith("DayType_")):
                     df[col] = 0
                 else:
                     df[col] = np.nan
         df = df.reindex(columns=MASTER_KEEP_STATIC)
+
+        table = pa.Table.from_pandas(df, preserve_index=False)
+        if self._writer is None:
+            self._schema = table.schema
+            self._writer = pq.ParquetWriter(self.out_path, self._schema, compression="snappy")
+        self._writer.write_table(table)
+
+    def close(self):
+        if self._writer is not None:
+            self._writer.close()
+            self._writer = None
+
+def append_panel_rows_parquet(writer: PanelParquetWriter, chunks: List[pd.DataFrame]):
+    if not chunks: return
+    aligned: List[pd.DataFrame] = []
+    for df in chunks:
+        df = _ensure_unique_columns(df)
         aligned.append(df)
     df_all = pd.concat(aligned, ignore_index=True, sort=False)
-    mode = "a" if header_written else "w"
-    df_all.to_csv(PANEL_OUT, mode=mode, header=not header_written, index=False)
-    return True
+    writer.write_chunk(df_all)
 
 def _derive_symbol_name(p: Path) -> str:
     name = p.name
@@ -514,85 +618,151 @@ def _derive_symbol_name(p: Path) -> str:
     name = re.sub(r"\.(parquet|csv)$","",name, flags=re.IGNORECASE)
     return name
 
-def collect_panel_from_paths(paths: List[Path]):
-    # Expand any directories to files here to keep function simple
+def _prepare_panel_rows(path_obj: Path):
+    sym = _derive_symbol_name(path_obj)
+    try:
+        df = load_one(path_obj)
+
+        # upstream sanity checks (ranges)
+        def _range_check(col, lo, hi):
+            if col in df.columns:
+                s = pd.to_numeric(df[col], errors="coerce")
+                bad = (~s.between(lo,hi)) & s.notna()
+                if bad.any():
+                    _log_load_error(sym, str(path_obj), f"Range anomaly {col} out of [{lo},{hi}] on {bad.sum()} rows")
+        _range_check("D_rsi14", 0, 100)
+
+        df = add_targets(df)
+        df, feats = featureize(df)
+        df = score_bias(df)
+        df["symbol"] = sym
+
+        df_train = df.dropna(subset=["ret_1d_close_pct"])
+        if df_train.empty:
+            nrows = len(df)
+            msg = (f"NO TRAIN {sym} rows={nrows} "
+                   f"req_cols_ok={all(c in df.columns for c in ['timestamp','open','high','low','close','volume'])}")
+            return sym, None, feats, msg
+
+        rows = df_train[["timestamp","symbol","open","high","low","close","volume"] + feats +
+                        ["ret_1d_close_pct","ret_3d_close_pct","ret_5d_close_pct",
+                         "long_score","short_score","D_atr14","D_cpr_width_pct"]].copy()
+        return sym, rows, feats, None
+    except Exception as e:
+        return sym, None, None, e
+
+def collect_panel_from_paths(paths: List[Path], load_workers: int = 1):
+    # Expand any directories to files
     expanded: List[Path] = []
     for p in paths:
         if Path(p).is_dir():
             expanded += _strict_file_list(str(p), None, None, accept_any_daily=False)
         else:
             expanded.append(Path(p))
-    paths = expanded
-
+    paths = sorted(expanded)
     total = len(paths)
     if total == 0:
-        pd.DataFrame(columns=MASTER_KEEP_STATIC).to_csv(PANEL_OUT, index=False)
+        # Create empty parquet with schema
+        empty = pd.DataFrame(columns=MASTER_KEEP_STATIC)
+        if not _PA_OK:
+            raise SystemExit("pyarrow is required to write panel_cache.parquet. Please run: pip install pyarrow")
+        table = pa.Table.from_pandas(empty, preserve_index=False)
+        pq.write_table(table, PANEL_OUT, compression="snappy")
         raise SystemExit(
             "No matching files found.\n"
             "Select files via --files or --gui, or provide --data-dir with *_daily.* files."
         )
+
     processed = load_processed_symbols()
-    header_written = Path(PANEL_OUT).exists()
     eta = ProgressETA(total=total, label="Load+Engineer")
     chunk: List[pd.DataFrame] = []
     total_rows_written = 0
-    for p in paths:
-        path_obj = Path(p)
-        sym = _derive_symbol_name(path_obj)
-        if sym in processed:
-            eta.tick(f"SKIP {sym}")
-            continue
-        try:
-            df = load_one(path_obj)
-            # upstream sanity checks (ranges)
-            def _range_check(col, lo, hi):
-                if col in df.columns:
-                    s = pd.to_numeric(df[col], errors="coerce")
-                    bad = (~s.between(lo,hi)) & s.notna()
-                    if bad.any():
-                        _log_load_error(sym, str(path_obj), f"Range anomaly {col} out of [{lo},{hi}] on {bad.sum()} rows")
-            _range_check("D_rsi14", 0, 100)
-            df = add_targets(df)
-            df, feats = featureize(df)
-            df = score_bias(df)
-            df["symbol"] = sym
-            df_train = df.dropna(subset=["ret_1d_close_pct"])
-            if df_train.empty:
-                nrows = len(df)
-                msg = (f"NO TRAIN {sym} rows={nrows} "
-                       f"req_cols_ok={all(c in df.columns for c in ['timestamp','open','high','low','close','volume'])}")
-                print("[Load+Engineer]", msg)
-                eta.tick(msg)
-                mark_processed(sym)
+    feats: Optional[List[str]] = None
+
+    if not _PA_OK:
+        raise SystemExit("pyarrow is required to write panel_cache.parquet. Please run: pip install pyarrow")
+    writer = PanelParquetWriter(PANEL_OUT)
+
+    def _pending_paths():
+        for path_obj in paths:
+            sym = _derive_symbol_name(path_obj)
+            if sym in processed:
+                eta.tick(f"SKIP {sym}")
                 continue
-            rows = df_train[["timestamp","symbol","open","high","low","close","volume"] + feats +
-                            ["ret_1d_close_pct","ret_3d_close_pct","ret_5d_close_pct",
-                             "long_score","short_score","D_atr14","D_cpr_width_pct"]].copy()
-            chunk.append(rows)
-            total_rows_written += len(rows)
-            if len(chunk) >= CHUNK_SIZE:
-                header_written = append_panel_rows(chunk, header_written)
-                chunk.clear()
-            mark_processed(sym)
-            eta.tick(f"OK {sym} (+{len(rows)} rows)")
-        except KeyboardInterrupt:
-            print("\nInterrupted! Autosaving current chunk...")
-            if chunk:
-                header_written = append_panel_rows(chunk, header_written)
-                chunk.clear()
-            raise
-        except Exception as e:
-            _log_load_error(sym, str(path_obj), str(e))
-            eta.tick(f"ERR {sym}: {e}")
-            # do NOT mark processed on failure; allow retry next run
+            yield path_obj
+
+    def _prepare_with_path(path_obj: Path):
+        return path_obj, _prepare_panel_rows(path_obj)
+
+    try:
+        if load_workers > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=int(load_workers)) as ex:
+                for path_obj, result in ex.map(_prepare_with_path, _pending_paths()):
+                    sym, rows, feats_out, msg_or_err = result
+                    if isinstance(msg_or_err, Exception):
+                        _log_load_error(sym, str(path_obj), str(msg_or_err))
+                        eta.tick(f"ERR {sym}: {msg_or_err}")
+                        continue
+                    if msg_or_err:
+                        print("[Load+Engineer]", msg_or_err)
+                        eta.tick(msg_or_err)
+                        mark_processed(sym)
+                        continue
+                    chunk.append(rows)
+                    if feats_out is not None:
+                        feats = feats_out
+                    total_rows_written += len(rows)
+                    if len(chunk) >= CHUNK_SIZE:
+                        append_panel_rows_parquet(writer, chunk)
+                        chunk.clear()
+                    mark_processed(sym)
+                    eta.tick(f"OK {sym} (+{len(rows)} rows)")
+        else:
+            for path_obj in paths:
+                sym = _derive_symbol_name(path_obj)
+                if sym in processed:
+                    eta.tick(f"SKIP {sym}")
+                    continue
+                sym, rows, feats_out, msg_or_err = _prepare_panel_rows(path_obj)
+                if isinstance(msg_or_err, Exception):
+                    _log_load_error(sym, str(path_obj), str(msg_or_err))
+                    eta.tick(f"ERR {sym}: {msg_or_err}")
+                    continue
+                if msg_or_err:
+                    print("[Load+Engineer]", msg_or_err)
+                    eta.tick(msg_or_err)
+                    mark_processed(sym)
+                    continue
+                chunk.append(rows)
+                if feats_out is not None:
+                    feats = feats_out
+                total_rows_written += len(rows)
+                if len(chunk) >= CHUNK_SIZE:
+                    append_panel_rows_parquet(writer, chunk)
+                    chunk.clear()
+                mark_processed(sym)
+                eta.tick(f"OK {sym} (+{len(rows)} rows)")
+    except KeyboardInterrupt:
+        print("\nInterrupted! Autosaving current chunk...")
+        if chunk:
+            append_panel_rows_parquet(writer, chunk)
+            chunk.clear()
+        writer.close()
+        raise
+
+    # Flush remaining chunk
     if chunk:
-        header_written = append_panel_rows(chunk, header_written)
+        append_panel_rows_parquet(writer, chunk)
         chunk.clear()
+    writer.close()
+
     print(f"[Panel] Total rows appended: {total_rows_written}")
-    if not Path(PANEL_OUT).exists():
-        pd.DataFrame(columns=MASTER_KEEP_STATIC).to_csv(PANEL_OUT, index=False)
+    if total_rows_written == 0:
+        empty = pd.DataFrame(columns=MASTER_KEEP_STATIC)
+        table = pa.Table.from_pandas(empty, preserve_index=False)
+        pq.write_table(table, PANEL_OUT, compression="snappy")
         raise SystemExit(
-            "No rows were written to panel_cache.csv.\n"
+            "No rows were written to panel_cache.parquet.\n"
             "Possible causes:\n"
             " • Files produced 0 trainable rows after target dropna\n"
             "Fixes:\n"
@@ -600,14 +770,14 @@ def collect_panel_from_paths(paths: List[Path]):
             " • Inspect a file to confirm columns: [timestamp, open, high, low, close, volume]\n"
             " • Ensure enough rows so ret_1d_close_pct isn’t all NaN"
         )
-    panel = pd.read_csv(PANEL_OUT, low_memory=False)
+
+    # Load back the written parquet to return a DataFrame view
+    panel = pd.read_parquet(PANEL_OUT)
     panel["timestamp"] = pd.to_datetime(panel["timestamp"], errors="coerce")
     panel = panel.dropna(subset=["timestamp"]).sort_values(["symbol","timestamp"]).reset_index(drop=True)
-    feats = [
-        c for c in MASTER_KEEP_STATIC
-        if c.startswith("D_") or c.startswith("CPR_Yday_") or c.startswith("CPR_Tmr_")
-        or c.startswith("Struct_") or c.startswith("DayType_")
-    ]
+    feats = [c for c in MASTER_KEEP_STATIC if (
+        c.startswith("D_") or c.startswith("CPR_Yday_") or c.startswith("CPR_Tmr_")
+        or c.startswith("Struct_") or c.startswith("DayType_"))]
     return panel, feats
 
 # ===================== Type sanitization =====================
@@ -678,7 +848,7 @@ def time_cv_by_timestamp(panel: pd.DataFrame,
     cut = np.linspace(0, len(uniq_dates), n_splits + 1, dtype=int)
     for i in range(n_splits):
         start_date = uniq_dates[cut[i]]
-        end_date = uniq_dates[cut[i+1]-1] if i < n_splits - 1 else uniq_dates[-1]
+        end_date   = uniq_dates[cut[i+1]-1] if i < n_splits - 1 else uniq_dates[-1]
         te_mask = (panel["timestamp"].dt.normalize() >= start_date) & (panel["timestamp"].dt.normalize() <= end_date)
         tr_mask = (panel["timestamp"].dt.normalize() < start_date)
         if embargo_days and embargo_days > 0:
@@ -706,13 +876,11 @@ def _make_calibrator(est, method="isotonic"):
     """
     from sklearn.calibration import CalibratedClassifierCV
     try:
-        # Newer scikit-learn (>= 1.0): uses 'estimator'
         return CalibratedClassifierCV(estimator=est, method=method, cv="prefit")
     except TypeError:
-        # Older scikit-learn: falls back to 'base_estimator'
         return CalibratedClassifierCV(base_estimator=est, method=method, cv="prefit")
 
-# ---------- 1D classification with calibration ----------
+# -------- 1D classification with calibration --------
 def train_1d_cls_calibrated(panel: pd.DataFrame, feats: List[str], margin_pct: float,
                             n_estimators: int, n_splits: int, embargo_days: int,
                             early_stopping_rounds: int):
@@ -731,7 +899,6 @@ def train_1d_cls_calibrated(panel: pd.DataFrame, feats: List[str], margin_pct: f
     y_full = y.loc[mask].astype(int).values
     oos_prob = np.full(len(X_full), np.nan)
     eta = ProgressETA(total=len(folds), label="Train 1D-CLS")
-    models = []
 
     def make_lgbm(random_state: int):
         depth = MAX_DEPTH_ALL if isinstance(MAX_DEPTH_ALL, int) and MAX_DEPTH_ALL > 0 else -1
@@ -749,6 +916,7 @@ def train_1d_cls_calibrated(panel: pd.DataFrame, feats: List[str], margin_pct: f
             verbosity=-1,
         )
 
+    models = []
     for fold_no, (tr_idx, te_idx) in enumerate(folds, start=1):
         tr_pos = np.where(np.isin(valid_idx, tr_idx))[0]
         te_pos = np.where(np.isin(valid_idx, te_idx))[0]
@@ -770,7 +938,7 @@ def train_1d_cls_calibrated(panel: pd.DataFrame, feats: List[str], margin_pct: f
         eta.tick(f"fold {fold_no} n={len(te_pos)}")
         models.append(calib)
 
-    # Final calibrated model: reserve last 20% (by date) for calibration
+    # Final calibrated model: reserve last 20% (by time) for calibration
     final_base = make_lgbm(1234)
     df_valid = panel.loc[mask, ["timestamp"]].copy()
     order = np.argsort(df_valid["timestamp"].values)
@@ -782,13 +950,11 @@ def train_1d_cls_calibrated(panel: pd.DataFrame, feats: List[str], margin_pct: f
     if early_stopping_rounds and early_stopping_rounds > 0:
         callbacks.insert(0, lgb.callback.early_stopping(stopping_rounds=int(early_stopping_rounds)))
     final_base.fit(X_tr_all, y_tr_all, eval_set=[(X_te_all, y_te_all)], eval_metric="binary_logloss", callbacks=callbacks)
-
     final_calib = _make_calibrator(final_base, method="isotonic")
     final_calib.fit(X_te_all, y_te_all)
-
     return final_calib, oos_prob, valid_idx
 
-# ---------- Regression (for 3D/5D; optional for 1D) ----------
+# -------- Regression (for 3D/5D; optional for 1D) --------
 def train_rf(panel: pd.DataFrame, feats: List[str], target_col: str, label: str,
              n_estimators: int = N_EST_ALL, refit_final: bool = False, n_splits: int = FOLDS,
              embargo_days: int = EMBARGO_DAYS, early_stopping_rounds: int = EARLY_STOPPING_ROUNDS):
@@ -899,7 +1065,6 @@ def nightly_watchlist(panel: pd.DataFrame, feats: List[str],
         last["prob_up_1d"] = m1_cls.predict_proba(X)[:, 1]
     else:
         last["prob_up_1d"] = np.nan
-
     if m1_reg is not None:
         last["pred_ret_1d_pct"] = m1_reg.predict(X)
     else:
@@ -911,7 +1076,7 @@ def nightly_watchlist(panel: pd.DataFrame, feats: List[str],
     best_it_5 = getattr(m5_use, "best_iteration_", None) if m5_use is not None else None
     last["pred_ret_5d_pct"] = (m5_use.predict(X, num_iteration=best_it_5) if m5_use is not None else np.nan)
 
-    # ---- Standard deviation for prob_up_5d ----
+    # ---- Std for prob_up_5d
     std5 = np.full(len(last), np.nan, dtype=float)
     if prob_std_method == "residual" and oos5_path is not None and Path(oos5_path).exists():
         oos5_df = pd.read_csv(oos5_path)
@@ -923,9 +1088,9 @@ def nightly_watchlist(panel: pd.DataFrame, feats: List[str],
             std_map2 = sym_hist.to_dict()
             sh = last["symbol"].map(std_map2).astype(float).values
             std5 = np.where(np.isfinite(std5), std5, sh)
-            if np.isnan(std5).mean() > 0.5:
-                cs = _cross_sectional_std(last["pred_ret_5d_pct"].values)
-                std5 = np.where(np.isfinite(std5), std5, cs)
+        if np.isnan(std5).mean() > 0.5:
+            cs = _cross_sectional_std(last["pred_ret_5d_pct"].values)
+            std5 = np.where(np.isfinite(std5), std5, cs)
     elif prob_std_method == "symbol_hist":
         sym_hist = _symbol_hist_roll_std(panel, window=int(prob_std_window), min_rows=int(prob_std_min_rows))
         std_map = sym_hist.to_dict()
@@ -938,45 +1103,110 @@ def nightly_watchlist(panel: pd.DataFrame, feats: List[str],
         std5[:] = cs
     else:  # "none"
         pass
+
     last["pred_std_5d"] = std5
     last["prob_up_5d"] = prob_up_from_gaussian(last["pred_ret_5d_pct"].values, std5)
 
     wl = last[(last["close"] >= MIN_CLOSE) & (last["avg20_vol"] >= MIN_AVG20_VOL)].copy()
     wl["bias"] = np.where(wl["long_score"] >= wl["short_score"], "LONG", "SHORT")
 
-    # Ranking: prioritize calibrated 1D probability, then 5D expected return
     wl = wl[["symbol","timestamp","close","avg20_vol",
              "prob_up_1d","pred_ret_1d_pct","pred_ret_3d_pct","pred_ret_5d_pct",
              "pred_std_5d","prob_up_5d",
              "D_atr14","D_cpr_width_pct","long_score","short_score","bias"]].sort_values(
-        ["prob_up_1d","pred_ret_5d_pct"], ascending=[False, False]
+             ["prob_up_1d","pred_ret_5d_pct"], ascending=[False, False]
     )
     wl.to_csv(WATCHLIST_OUT, index=False)
     print(f"Saved: {WATCHLIST_OUT} rows={len(wl)}")
     return wl
 
 # ===================== SHAP (latest rows only) =====================
+def _unwrap_model_for_shap(m):
+    """
+    Return a model suitable for shap.TreeExplainer if possible.
+    For CalibratedClassifierCV, unwrap to the underlying LightGBM estimator.
+    Supports both old and new scikit-learn attribute names.
+    """
+    try:
+        from sklearn.calibration import CalibratedClassifierCV
+    except Exception:
+        CalibratedClassifierCV = tuple()  # type: ignore
+
+    if not isinstance(m, CalibratedClassifierCV):
+        return m
+
+    # Try newer sklearn API first: .estimator
+    try:
+        calibrators = getattr(m, "calibrated_classifiers_", None)
+        if calibrators and hasattr(calibrators[0], "estimator"):
+            base = calibrators[0].estimator
+            if base is not None:
+                print("Using CalibratedClassifierCV .estimator for SHAP.")
+                return base
+    except Exception as e:
+        print(f"WARNING: Unwrap via .estimator failed: {e}")
+
+    # Try older sklearn: .base_estimator
+    try:
+        calibrators = getattr(m, "calibrated_classifiers_", None)
+        if calibrators and hasattr(calibrators[0], "base_estimator"):
+            base = calibrators[0].base_estimator
+            if base is not None:
+                print("Using CalibratedClassifierCV .base_estimator for SHAP.")
+                return base
+    except Exception as e:
+        print(f"WARNING: Unwrap via .base_estimator failed: {e}")
+
+    print("WARNING: Could not unwrap CalibratedClassifierCV; SHAP will be skipped.")
+    return m
+
 def compute_shap_latest(panel: pd.DataFrame, feats: List[str], model, top_k: int = TOP_SHAP_PER_SYMBOL, shap_max_symbols: Optional[int] = None):
-    try: import shap
-    except Exception: raise SystemExit("shap not installed. Run: pip install shap")
+    try:
+        import shap
+    except Exception:
+        raise SystemExit("shap not installed. Run: pip install shap")
+
+    # Unwrap calibrated model if possible
+    shap_model = _unwrap_model_for_shap(model)
+
+    # Ensure we have a LightGBM estimator for TreeExplainer
+    try:
+        from lightgbm.sklearn import LGBMClassifier, LGBMRegressor
+        if not isinstance(shap_model, (LGBMClassifier, LGBMRegressor)):
+            print("Unwrapped model is not a LightGBM estimator; SHAP will be skipped.")
+            return pd.DataFrame(), pd.DataFrame()
+    except Exception:
+        print("LightGBM not available; SHAP will be skipped.")
+        return pd.DataFrame(), pd.DataFrame()
+
     latest = panel.groupby("symbol", as_index=False).tail(1).copy()
     latest["avg20_vol"] = panel.groupby("symbol")["volume"].tail(1).values if "avg20_vol" not in latest \
-        else latest["avg20_vol"]
+                           else latest["avg20_vol"]
     latest = latest[(latest["close"] >= MIN_CLOSE) & (latest["avg20_vol"].fillna(0) >= MIN_AVG20_VOL)]
     if shap_max_symbols is not None and shap_max_symbols > 0 and len(latest) > shap_max_symbols:
         latest = latest.sample(n=int(shap_max_symbols), random_state=42)
+
     X = sanitize_feature_matrix(latest[feats].copy())
     print("Computing SHAP values on latest rows...")
     import shap as _shap_mod
-    explainer = _shap_mod.TreeExplainer(model)
+    try:
+        explainer = _shap_mod.TreeExplainer(shap_model)
+    except Exception as e:
+        print(f"SHAP computation skipped: TreeExplainer does not support model type ({e}).")
+        return pd.DataFrame(), pd.DataFrame()
+
     shap_vals = explainer.shap_values(X)
     if isinstance(shap_vals, list) and len(shap_vals) >= 2:
         shap_arr = shap_vals[1]  # positive class for classifier
     else:
         shap_arr = shap_vals
+
     base_val = explainer.expected_value
-    try: base_val = float(np.ravel(base_val)[-1]) if isinstance(base_val, (list, tuple, np.ndarray)) else float(base_val)
-    except Exception: base_val = 0.0
+    try:
+        base_val = float(np.ravel(base_val)[-1]) if isinstance(base_val, (list, tuple, np.ndarray)) else float(base_val)
+    except Exception:
+        base_val = 0.0
+
     rows, global_abs = [], defaultdict(list)
     eta = ProgressETA(total=len(latest), label="SHAP latest")
     for i, (_, row) in enumerate(latest.iterrows()):
@@ -984,7 +1214,10 @@ def compute_shap_latest(panel: pd.DataFrame, feats: List[str], model, top_k: int
         try:
             pred1 = float(model.predict_proba(X.iloc[[i]])[:,1][0])
         except Exception:
-            pred1 = float(model.predict(X.iloc[[i]])[0])
+            try:
+                pred1 = float(shap_model.predict_proba(X.iloc[[i]])[:,1][0])
+            except Exception:
+                pred1 = np.nan
         vals = shap_arr[i]
         idx = np.argsort(-np.abs(vals))[:top_k]
         for rank, j in enumerate(idx, start=1):
@@ -1019,23 +1252,23 @@ def build_shap_cards(shap_df: pd.DataFrame, top_k: int = 6):
     return cards
 
 # ===================== Extra outputs =====================
-def write_parquet_single(panel: pd.DataFrame, out_dir: str):
-    pq_path = Path(out_dir) / "panel_cache.parquet"
-    try:
-        panel.to_parquet(pq_path, index=False)
-        print(f"Saved Parquet (single): {pq_path}")
-    except Exception as e:
-        print(f"Parquet write failed ({e}); skipping.")
-
-def write_by_year_csv(panel: pd.DataFrame, out_dir: str):
+def write_by_year_parquet(panel: pd.DataFrame, out_dir: str):
+    """
+    Year-by-year splits in Parquet:
+    <out_dir>/panel_by_year/panel_<YYYY>.parquet
+    """
     by_year_dir = Path(out_dir) / "panel_by_year"
     by_year_dir.mkdir(exist_ok=True)
     years = panel["timestamp"].dt.year.unique()
     for y in sorted(years):
         dfy = panel[panel["timestamp"].dt.year == y]
-        outp = by_year_dir / f"panel_{y}.csv"
-        dfy.to_csv(outp, index=False)
-        print(f"Saved year CSV: {outp} (rows={len(dfy)})")
+        outp = by_year_dir / f"panel_{y}.parquet"
+        if _PA_OK:
+            table = pa.Table.from_pandas(dfy, preserve_index=False)
+            pq.write_table(table, outp, compression="snappy")
+        else:
+            dfy.to_parquet(outp, index=False)
+        print(f"Saved year Parquet: {outp} (rows={len(dfy)})")
 
 def write_excel_compact(panel: pd.DataFrame, wl: pd.DataFrame, out_dir: str):
     xlsx_path = Path(out_dir) / "panel_compact.xlsx"
@@ -1063,8 +1296,14 @@ def write_excel_topN(panel: pd.DataFrame, out_dir: str, n: int):
         print(f"Excel write failed ({e}); install openpyxl to enable --excel-top-rows")
 
 # ===================== Checkpoints =====================
-import joblib
+def _load_joblib():
+    spec = importlib.util.find_spec("joblib")
+    if spec is None:
+        raise SystemExit("joblib is required for saving/loading checkpoints. Please run `pip install joblib`.")
+    return importlib.import_module("joblib")
+
 def maybe_load_model(path: Path):
+    joblib = _load_joblib()
     try:
         if path.exists():
             print(f"Loading checkpoint: {path}")
@@ -1074,6 +1313,7 @@ def maybe_load_model(path: Path):
     return None
 
 def save_model(path: Path, model):
+    joblib = _load_joblib()
     try:
         joblib.dump(model, path)
         print(f"Saved model checkpoint: {path}")
@@ -1146,30 +1386,31 @@ def build_condition_columns(df: pd.DataFrame) -> OrderedDict:
         conds[k] = (df.get(k, 0) == 1)
     # Trend & Momentum
     conds["EMA_stack_20_50_100"] = df.get("D_ema_stack_20_50_100", False).fillna(False).astype(bool)
-    conds["RSI7_gt_RSI14"] = df.get("D_rsi7_gt_rsi14", False).fillna(False).astype(bool)
-    conds["RSI14_50_70"] = c("D_rsi14").between(50,70)
+    conds["RSI7_gt_RSI14"]       = df.get("D_rsi7_gt_rsi14", False).fillna(False).astype(bool)
+    conds["RSI14_50_70"]         = c("D_rsi14").between(50,70)
     adx = c("D_adx14"); pdi = c("D_pdi14"); mdi = c("D_mdi14")
-    conds["ADX_gt20_PDIgtMDI"] = ((adx > 20) & (pdi > mdi))
+    conds["ADX_gt20_PDIgtMDI"]   = ((adx > 20) & (pdi > mdi))
     eang = c("D_ema20_angle_deg")
-    conds["EMA20_angle_pos"] = eang > 0
+    conds["EMA20_angle_pos"]     = eang > 0
     # CPR width bands
     cprw = c("D_cpr_width_pct")
-    conds["CPR_width_narrow"] = cprw < 0.5
-    conds["CPR_width_wide"] = cprw > 1.0
+    conds["CPR_width_narrow"]    = cprw < 0.5
+    conds["CPR_width_wide"]      = cprw > 1.0
     # OBV / PA
-    conds["OBV_slope_up"] = c("D_obv_slope") > 0
-    conds["Price_OBV_rising"] = df.get("D_price_and_obv_rising", False).fillna(False).astype(bool)
+    conds["OBV_slope_up"]        = c("D_obv_slope") > 0
+    conds["Price_OBV_rising"]    = df.get("D_price_and_obv_rising", False).fillna(False).astype(bool)
     # NR / ATR
-    conds["NR_day"] = df.get("D_nr_day", False).fillna(False).astype(bool)
-    conds["range_to_atr14_lt1"] = c("D_range_to_atr14") < 1.0
+    conds["NR_day"]              = df.get("D_nr_day", False).fillna(False).astype(bool)
+    conds["range_to_atr14_lt1"]  = c("D_range_to_atr14") < 1.0
     # MA / Swing / Breakout
-    conds["close_gt_sma20"] = c("D_sma20") < df["close"]
-    conds["HH_or_HL"] = (df.get("D_hh", False).fillna(False).astype(bool) |
-                         df.get("D_hl", False).fillna(False).astype(bool))
-    conds["close_gt_prev_high"] = df["close"] > c("D_prev_high")
+    conds["close_gt_sma20"]      = c("D_sma20") < df["close"]
+    conds["HH_or_HL"]            = (df.get("D_hh", False).fillna(False).astype(bool)
+                                    | df.get("D_hl", False).fillna(False).astype(bool))
+    conds["close_gt_prev_high"]  = df["close"] > c("D_prev_high")
     # Regime
-    conds["golden_regime"] = df.get("D_golden_regime", False).fillna(False).astype(bool)
-    conds["daily_weekly_up"] = ((c("D_daily_trend")==1) & (c("D_weekly_trend")==1))
+    conds["golden_regime"]       = df.get("D_golden_regime", False).fillna(False).astype(bool)
+    conds["daily_weekly_up"]     = ((c("D_daily_trend")==1) & (c("D_weekly_trend")==1))
+
     for k in list(conds.keys()):
         s = conds[k]
         conds[k] = s.fillna(False).astype(bool) if s.dtype != bool else s.fillna(False)
@@ -1196,13 +1437,15 @@ def evaluate_conditions_oos(panel: pd.DataFrame, horizon: str, oos_df: pd.DataFr
     if thin_inference and horizon in ("3d","5d"):
         thin_mask = non_overlapping_oos_mask(panel, horizon, oos_mask)
         oos_mask = oos_mask & thin_mask
+
     ret_col = f"ret_{horizon}_close_pct"
     valid_rows = panel.index[oos_mask]
     if len(valid_rows) == 0:
         return pd.DataFrame(columns=["size","combo","support","hit_rate","mean_ret_%","wilson_low","wilson_high",
                                      "stability_qtr_std","p_value","bh_threshold","fdr_ok"])
     rets = panel.loc[valid_rows, ret_col].astype(float)
-    ts = panel.loc[valid_rows, "timestamp"]
+    ts   = panel.loc[valid_rows, "timestamp"]
+
     cond_cols = OrderedDict()
     for name, series in conds.items():
         cond_cols[name] = series.loc[valid_rows].fillna(False).astype(bool)
@@ -1226,7 +1469,7 @@ def evaluate_conditions_oos(panel: pd.DataFrame, horizon: str, oos_df: pd.DataFr
         else: return max(min_support, 0)
 
     names = list(cond_cols.keys())
-    arrs = {k: cond_cols[k].values for k in names}
+    arrs  = {k: cond_cols[k].values for k in names}
     rows_by_size: Dict[int, List[dict]] = {s: [] for s in range(1, max_combo_size+1)}
     support_by_combo: Dict[Tuple[str, ...], int] = {}
 
@@ -1260,6 +1503,7 @@ def evaluate_conditions_oos(panel: pd.DataFrame, horizon: str, oos_df: pd.DataFr
     all_rows: List[dict] = []
     for s in range(1, max_combo_size+1):
         all_rows.extend(rows_by_size.get(s, []))
+
     if all_rows:
         dfw = pd.DataFrame(all_rows).sort_values("p_value").reset_index(drop=True)
         m = len(dfw)
@@ -1314,6 +1558,7 @@ def actionable_from_ww5d(panel: pd.DataFrame, wl: pd.DataFrame,
         for combo in combo_list:
             if combo_fires(r, combo): hit_count += 1
         hits.append({"symbol": sym, "global_hits": hit_count})
+
     hits_df = pd.DataFrame(hits)
     out = wl.copy().merge(hits_df, on="symbol", how="left")
     out["global_hits"] = out["global_hits"].fillna(0).astype(int)
@@ -1382,8 +1627,7 @@ def _recent_accuracy_for_horizon(panel: pd.DataFrame, oos_path: Path, horizon: s
             "mean_pred_%": mean_pred, "mean_real_%": mean_real,
             "pearson_r": pearson_r, "wilson_low": wl, "wilson_high": wh}
 
-def write_recent_accuracy_report(panel: pd.DataFrame, oos1_path: Path, oos3_path: Path, oos5_path: Path,
-                                 out_dir: str, last_days: int = 30) -> pd.DataFrame:
+def write_recent_accuracy_report(panel: pd.DataFrame, oos1_path: Path, oos3_path: Path, oos5_path: Path, out_dir: str, last_days: int = 30) -> pd.DataFrame:
     rows = []
     rows.append(_recent_accuracy_for_horizon(panel, oos1_path, "1d", last_days))
     rows.append(_recent_accuracy_for_horizon(panel, oos3_path, "3d", last_days))
@@ -1406,17 +1650,19 @@ def _symbol_accuracy_oos(panel: pd.DataFrame, oos_df: pd.DataFrame, horizon: str
     if thin_inference and horizon in ("3d","5d"):
         thin_mask = non_overlapping_oos_mask(panel, horizon, oos_mask)
         oos_mask = oos_mask & thin_mask
-    idx_all = panel.index[oos_mask]
+
+    idx_all   = panel.index[oos_mask]
     preds_all = pd.to_numeric(oos_df.set_index("panel_idx").loc[idx_all, "oos_pred"], errors="coerce")
-    rets_all = pd.to_numeric(panel.loc[idx_all, f"ret_{horizon}_close_pct"], errors="coerce")
-    ts_all = panel.loc[idx_all, "timestamp"]
-    sym_all = panel.loc[idx_all, "symbol"]
+    rets_all  = pd.to_numeric(panel.loc[idx_all, f"ret_{horizon}_close_pct"], errors="coerce")
+    ts_all    = panel.loc[idx_all, "timestamp"]
+    sym_all   = panel.loc[idx_all, "symbol"]
+
     rows = []
     for sym, grp_idx in pd.Series(idx_all, index=idx_all).groupby(sym_all.values):
-        idx = grp_idx.values
+        idx  = grp_idx.values
         pred = preds_all.loc[idx].values
         real = rets_all.loc[idx].values
-        ts = ts_all.loc[idx]
+        ts   = ts_all.loc[idx]
         valid = np.isfinite(pred) & np.isfinite(real)
         pred = pred[valid]; real = real[valid]; ts = ts[valid]
         if len(pred) == 0:
@@ -1432,7 +1678,7 @@ def _symbol_accuracy_oos(panel: pd.DataFrame, oos_df: pd.DataFrame, horizon: str
         total = int(non_ties.sum())
         hit_rate = (100.0 * hits / total) if total > 0 else np.nan
         abs_err = np.abs(real - pred)
-        mae = float(np.mean(abs_err))
+        mae  = float(np.mean(abs_err))
         rmse = float(np.sqrt(np.mean((real - pred)**2)))
         mean_pred = float(np.mean(pred))
         mean_real = float(np.mean(real))
@@ -1450,8 +1696,7 @@ def _symbol_accuracy_oos(panel: pd.DataFrame, oos_df: pd.DataFrame, horizon: str
     df = pd.DataFrame(rows).sort_values(["symbol","horizon"])
     return df
 
-def write_symbol_accuracy_oos(panel: pd.DataFrame, oos1_path: Path, oos3_path: Path, oos5_path: Path,
-                              out_dir: str, thin_inference: bool = True) -> pd.DataFrame:
+def write_symbol_accuracy_oos(panel: pd.DataFrame, oos1_path: Path, oos3_path: Path, oos5_path: Path, out_dir: str, thin_inference: bool = True) -> pd.DataFrame:
     o1 = load_oos(oos1_path); o3 = load_oos(oos3_path); o5 = load_oos(oos5_path)
     df1 = _symbol_accuracy_oos(panel, o1, "1d", thin_inference)
     df3 = _symbol_accuracy_oos(panel, o3, "3d", thin_inference)
@@ -1516,7 +1761,6 @@ def write_combined_watchlist_summary(out_dir: str,
 
     dict_df = indicator_dictionary()
     out["notes"] = ""
-
     cols_order = [
         "symbol","timestamp","close","avg20_vol","bias",
         "prob_up_1d","pred_ret_1d_pct","pred_ret_3d_pct","pred_ret_5d_pct","prob_up_5d",
@@ -1530,7 +1774,8 @@ def write_combined_watchlist_summary(out_dir: str,
         if c not in out.columns:
             out[c] = np.nan if c not in ["actionable","notes"] else (False if c=="actionable" else "")
     out = out[cols_order]
-    out_csv = Path(out_dir) / "combined_watchlist_summary.csv"
+
+    out_csv  = Path(out_dir) / "combined_watchlist_summary.csv"
     out_xlsx = Path(out_dir) / "combined_watchlist_summary.xlsx"
     out.to_csv(out_csv, index=False)
     try:
@@ -1548,32 +1793,40 @@ def _maybe_delete_artifacts():
         p = Path(PANEL_OUT); q = Path(PROCESSED_LIST)
         if p.exists(): p.unlink()
         if q.exists(): q.unlink()
-        print("Deleted previous panel_cache.csv and processed_symbols.txt (rebuild requested).")
+        print("Deleted previous panel_cache and processed_symbols (rebuild requested).")
     except Exception as e:
         print(f"Cleanup warning: {e}")
 
 def resolve_input_paths(args) -> List[Path]:
     accept_any = str(args.accept_any_daily).lower() in ("true","1","yes","y","t")
     if args.files:
-        paths = [Path(p) for p in args.files]
-        return paths
+        return [Path(p) for p in args.files]
     if args.gui:
         picked = pick_files_or_dir_gui()
         if not picked:
             print("GUI selection cancelled. Falling back to --data-dir.")
         else:
-            # If a folder is picked, expand to files in that folder
             if len(picked) == 1 and picked[0].is_dir():
                 return _strict_file_list(str(picked[0]), args.symbols_like, args.limit_files, accept_any_daily=accept_any)
             else:
                 return [p for p in picked if p.is_file()]
-    # Fallback: data-dir
     return _strict_file_list(args.data_dir, args.symbols_like, args.limit_files, accept_any_daily=accept_any)
+
+def _read_panel_any(path: Path) -> pd.DataFrame:
+    if path.suffix.lower() == ".parquet":
+        panel = pd.read_parquet(path)
+    else:
+        panel = pd.read_csv(path, low_memory=False)
+    panel["timestamp"] = pd.to_datetime(panel["timestamp"], errors="coerce")
+    panel["timestamp"] = ensure_kolkata_tz(panel["timestamp"])
+    panel = panel.dropna(subset=["timestamp"]).sort_values(["symbol","timestamp"]).reset_index(drop=True)
+    return panel
 
 def main():
     args = parse_cli()
     out_dir = args.out_dir
     setup_paths(out_dir)
+
     global FOLDS, EMBARGO_DAYS, HAC_LAG, THIN_INFERENCE
     global MAX_COMBO_SIZE, MIN_SUPPORT_GLOBAL, MIN_SUPPORT_COMBO, MIN_SUPPORT_COMBO_4, MIN_SUPPORT_COMBO_5
     global CHUNK_SIZE, SHAP_MAX_SYMBOLS
@@ -1584,87 +1837,80 @@ def main():
     EMBARGO_DAYS = int(args.embargo_days)
     HAC_LAG = args.hac_lag
     THIN_INFERENCE = str(args.thin_inference).lower() in ("true","1","yes","y","t")
-    MAX_COMBO_SIZE = int(args.max_combo_size)
-    MIN_SUPPORT_GLOBAL = int(args.min_support_global)
-    MIN_SUPPORT_COMBO = int(args.min_support_combo)
-    MIN_SUPPORT_COMBO_4 = int(args.min_support_combo_4)
-    MIN_SUPPORT_COMBO_5 = int(args.min_support_combo_5)
-    CHUNK_SIZE = int(args.chunk_size)
-    SHAP_MAX_SYMBOLS = args.shap_max_symbols
-    N_EST_1D = int(args.n_estimators_1d)
-    N_EST_3D = int(args.n_estimators_3d)
-    N_EST_5D = int(args.n_estimators_5d)
+    MAX_COMBO_SIZE        = int(args.max_combo_size)
+    MIN_SUPPORT_GLOBAL    = int(args.min_support_global)
+    MIN_SUPPORT_COMBO     = int(args.min_support_combo)
+    MIN_SUPPORT_COMBO_4   = int(args.min_support_combo_4)
+    MIN_SUPPORT_COMBO_5   = int(args.min_support_combo_5)
+    CHUNK_SIZE            = int(args.chunk_size)
+    SHAP_MAX_SYMBOLS      = args.shap_max_symbols
+    N_EST_1D              = int(args.n_estimators_1d)
+    N_EST_3D              = int(args.n_estimators_3d)
+    N_EST_5D              = int(args.n_estimators_5d)
     EARLY_STOPPING_ROUNDS = int(args.early_stopping_rounds)
-    PROB_STD_METHOD = args.prob_std_method
-    PROB_STD_WINDOW = int(args.prob_std_window)
-    PROB_STD_MIN_ROWS = int(args.prob_std_min_rows)
-    CLS_MARGIN = float(args.cls_margin)
-    WRITE_SYMBOL_ACC = str(args.write_symbol_accuracy).lower() in ("true","1","yes","y","t")
+    PROB_STD_METHOD       = args.prob_std_method
+    PROB_STD_WINDOW       = int(args.prob_std_window)
+    PROB_STD_MIN_ROWS     = int(args.prob_std_min_rows)
+    CLS_MARGIN            = float(args.cls_margin)
+    WRITE_SYMBOL_ACC      = str(args.write_symbol_accuracy).lower() in ("true","1","yes","y","t")
 
     if args.rebuild: _maybe_delete_artifacts()
 
     print(f"Outputs dir: {Path(out_dir).resolve()}")
     t0 = time.perf_counter()
 
-    # 0) Panel load/collect: prioritize panel_path, otherwise resume if PANEL_OUT exists
+    # 0) Panel load/collect: prefer --panel-path; else resume from panel_cache.parquet if present; else collect from files
     write_status("panel_build", "starting")
-    panel: pd.DataFrame
-    feats: List[str]
     if args.panel_path and Path(args.panel_path).exists():
         print(f"Loading panel from --panel-path: {args.panel_path}")
-        panel = pd.read_csv(args.panel_path, low_memory=False)
-        panel["timestamp"] = pd.to_datetime(panel["timestamp"], errors="coerce")
-        panel = panel.dropna(subset=["timestamp"]).sort_values(["symbol","timestamp"]).reset_index(drop=True)
+        panel = _read_panel_any(Path(args.panel_path))
         feats = [c for c in panel.columns if (
-                    c.startswith("D_") or c.startswith("CPR_Yday_") or c.startswith("CPR_Tmr_")
-                    or c.startswith("Struct_") or c.startswith("DayType_"))]
+            c.startswith("D_") or c.startswith("CPR_Yday_") or c.startswith("CPR_Tmr_")
+            or c.startswith("Struct_") or c.startswith("DayType_"))]
     elif (not args.rebuild) and Path(PANEL_OUT).exists():
         print(f"Loading existing panel: {PANEL_OUT}")
-        panel = pd.read_csv(PANEL_OUT, low_memory=False)
-        panel["timestamp"] = pd.to_datetime(panel["timestamp"], errors="coerce")
-        panel = panel.dropna(subset=["timestamp"]).sort_values(["symbol","timestamp"]).reset_index(drop=True)
+        panel = _read_panel_any(Path(PANEL_OUT))
         feats = [c for c in panel.columns if (
-                    c.startswith("D_") or c.startswith("CPR_Yday_") or c.startswith("CPR_Tmr_")
-                    or c.startswith("Struct_") or c.startswith("DayType_"))]
+            c.startswith("D_") or c.startswith("CPR_Yday_") or c.startswith("CPR_Tmr_")
+            or c.startswith("Struct_") or c.startswith("DayType_"))]
     else:
         paths = resolve_input_paths(args)
-        panel, feats = collect_panel_from_paths(paths)
-
+        panel, feats = collect_panel_from_paths(paths, load_workers=int(args.load_workers))
     write_status("panel_build", "done")
     print(f"Panel rows: {len(panel)} symbols: {panel['symbol'].nunique()} feats: {len(feats)}")
 
-    # Early writes (skip if loaded from external path)
-    if not (args.panel_path and Path(args.panel_path).exists()):
-        write_parquet_single(panel, out_dir)
-        write_by_year_csv(panel, out_dir)
+    # 1) Year-by-year splits -> Parquet
+    write_by_year_parquet(panel, out_dir)
 
     # 2) Train / Checkpoints
     m1_reg_path = Path(out_dir) / "model_1d_reg.joblib"
     m1_cls_path = Path(out_dir) / "model_1d_cls_calib.joblib"
-    m3_path = Path(out_dir) / "model_3d_rf.joblib"
-    m5_path = Path(out_dir) / "model_5d_rf.joblib"
+    m3_path     = Path(out_dir) / "model_3d_rf.joblib"
+    m5_path     = Path(out_dir) / "model_5d_rf.joblib"
+
     oos1_reg_path = Path(out_dir) / "oos_preds_1d_reg.csv"
     oos1_cls_path = Path(out_dir) / "oos_probs_1d_cls.csv"
-    oos3_path = Path(out_dir) / "oos_preds_3d.csv"
-    oos5_path = Path(out_dir) / "oos_preds_5d.csv"
+    oos3_path     = Path(out_dir) / "oos_preds_3d.csv"
+    oos5_path     = Path(out_dir) / "oos_preds_5d.csv"
 
     train_mode = args.train_1d_mode  # "cls"|"reg"|"both"
-
     m1_reg = None; m1_cls = None
+
     # 1D CLS
     if train_mode in ("cls","both"):
         m1_cls = maybe_load_model(m1_cls_path)
         if m1_cls is None or not oos1_cls_path.exists():
             write_status("train_1d_cls", "starting")
             m1_cls, oos1_prob, idx1 = train_1d_cls_calibrated(panel, feats, CLS_MARGIN,
-                                                               n_estimators=N_EST_1D,
-                                                               n_splits=FOLDS, embargo_days=EMBARGO_DAYS,
-                                                               early_stopping_rounds=EARLY_STOPPING_ROUNDS)
+                                                              n_estimators=N_EST_1D,
+                                                              n_splits=FOLDS, embargo_days=EMBARGO_DAYS,
+                                                              early_stopping_rounds=EARLY_STOPPING_ROUNDS)
             write_status("train_1d_cls", "done")
             save_model(m1_cls_path, m1_cls)
             save_oos(oos1_cls_path, oos1_prob, idx1)
         else:
             write_status("train_1d_cls", "skipped (checkpoint)")
+
     # 1D REG (optional)
     if train_mode in ("reg","both"):
         m1_reg = maybe_load_model(m1_reg_path)
@@ -1724,20 +1970,24 @@ def main():
                            prob_std_min_rows=PROB_STD_MIN_ROWS)
     write_status("watchlist", "done")
 
-    # 4) SHAP (1D latest) — prefer classifier if present; else regression 1D
-    shap_df = None
+    # 4) SHAP (1D latest) — prefer classifier; else regression 1D
     shap_model = m1_cls if m1_cls is not None else (m1_reg if m1_reg is not None else None)
     if "1d" in COMPUTE_SHAP_FOR and shap_model is not None:
         write_status("shap_1d", "starting")
         shap_df, shap_global = compute_shap_latest(panel, feats, shap_model, top_k=TOP_SHAP_PER_SYMBOL,
                                                    shap_max_symbols=SHAP_MAX_SYMBOLS)
-        pd.DataFrame(shap_df).to_csv(SHAP_CARDS_CSV, index=False)
-        pd.DataFrame(shap_global).to_csv(SHAP_GLOBAL_SUMMARY, index=False)
-        cards = build_shap_cards(shap_df, top_k=6)
-        with open(SHAP_CARDS_JSON, "w", encoding="utf-8") as f:
-            json.dump(cards, f, indent=2)
+
+        # Guard: if SHAP unsupported or empty, skip cards gracefully
+        if shap_df is None or shap_df.empty or ("symbol" not in shap_df.columns):
+            print("SHAP skipped or returned no rows; cards will not be built.")
+        else:
+            pd.DataFrame(shap_df).to_csv(SHAP_CARDS_CSV, index=False)
+            pd.DataFrame(shap_global).to_csv(SHAP_GLOBAL_SUMMARY, index=False)
+            cards = build_shap_cards(shap_df, top_k=6)
+            with open(SHAP_CARDS_JSON, "w", encoding="utf-8") as f:
+                json.dump(cards, f, indent=2)
+            print(f"Saved: {SHAP_CARDS_CSV}, {SHAP_GLOBAL_SUMMARY}, {SHAP_CARDS_JSON}")
         write_status("shap_1d", "done")
-        print(f"Saved: {SHAP_CARDS_CSV}, {SHAP_GLOBAL_SUMMARY}, {SHAP_CARDS_JSON}")
 
     # 5) What Worked (multi-horizon)
     try:
@@ -1760,6 +2010,7 @@ def main():
             except Exception as e:
                 ww1.to_csv(Path(GLOBAL_WORKS_1D_XLSX).with_suffix(".csv"), index=False)
                 print(f"Excel write failed ({e}); wrote CSV fallback for 1D WhatWorked.")
+
         if Path(oos3_path).exists():
             ww3 = evaluate_conditions_oos(panel, "3d", pd.read_csv(oos3_path), conds, MIN_SUPPORT_GLOBAL,
                                           hac_lag=HAC_LAG, thin_inference=THIN_INFERENCE,
@@ -1774,6 +2025,7 @@ def main():
             except Exception as e:
                 ww3.to_csv(Path(GLOBAL_WORKS_3D_XLSX).with_suffix(".csv"), index=False)
                 print(f"Excel write failed ({e}); wrote CSV fallback for 3D WhatWorked.")
+
         if Path(oos5_path).exists():
             ww5 = evaluate_conditions_oos(panel, "5d", pd.read_csv(oos5_path), conds, MIN_SUPPORT_GLOBAL,
                                           hac_lag=HAC_LAG, thin_inference=THIN_INFERENCE,
@@ -1788,7 +2040,6 @@ def main():
             except Exception as e:
                 ww5.to_csv(Path(GLOBAL_WORKS_5D_XLSX).with_suffix(".csv"), index=False)
                 print(f"Excel write failed ({e}); wrote CSV fallback for 5D WhatWorked.")
-
         write_status("what_works", "done")
 
         # 6) Optional actionable overlay for 5D
@@ -1841,4 +2092,4 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\nInterrupted — partial results saved (panel_cache, processed_symbols, model checkpoints). Re-run to resume.")
+        print("\nInterrupted — partial results saved (panel_cache.parquet, processed_symbols, model checkpoints). Re-run to resume.")
